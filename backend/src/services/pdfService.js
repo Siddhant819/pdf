@@ -122,6 +122,101 @@ async function getPdfInfo(filePath) {
   };
 }
 
+async function extractTextFromPdf(filePath) {
+  const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const workerPath = require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
+  GlobalWorkerOptions.workerSrc = `file://${workerPath}`;
+
+  const pdfBytes = fs.readFileSync(filePath);
+  const pdf = await getDocument({ data: new Uint8Array(pdfBytes) }).promise;
+
+  const pages = [];
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 1 });
+    const textContent = await page.getTextContent();
+
+    const items = [];
+    let itemId = 0;
+    for (const item of textContent.items) {
+      if (!item.str) continue;
+      const transform = item.transform;
+      const x = transform[4];
+      const y = transform[5];
+      const a = transform[0];
+      const b = transform[1];
+      const fontSize = Math.max(Math.round(Math.sqrt(a * a + b * b)), 6);
+
+      items.push({
+        id: `p${pageNum}_i${itemId++}`,
+        text: item.str,
+        x,
+        y,
+        // Fall back to an approximate char width when pdfjs omits the width value
+        // 0.6 is a common approximation for Helvetica-like fonts (char width / em size)
+        width: item.width || fontSize * item.str.length * 0.6,
+        height: item.height || fontSize,
+        fontSize,
+        fontName: item.fontName || '',
+      });
+    }
+
+    pages.push({
+      pageNum,
+      width: viewport.width,
+      height: viewport.height,
+      items,
+    });
+  }
+
+  return pages;
+}
+
+async function applyTextEdits(filePath, edits) {
+  const pdfBytes = fs.readFileSync(filePath);
+  const pdf = await PDFDocument.load(pdfBytes);
+
+  const { rgb, StandardFonts } = require('pdf-lib');
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+
+  for (const edit of edits) {
+    if (edit.newText === edit.originalText) continue;
+
+    const { pageNum, x, y, width, height, fontSize, newText } = edit;
+    const pageIndex = (parseInt(pageNum) || 1) - 1;
+    if (pageIndex < 0 || pageIndex >= pdf.getPageCount()) continue;
+
+    const page = pdf.getPage(pageIndex);
+    const fsVal = parseFloat(fontSize) || 12;
+    const textWidth = parseFloat(width) || 100;
+    const textHeight = parseFloat(height) || fsVal;
+    const posX = parseFloat(x);
+    const posY = parseFloat(y);
+
+    page.drawRectangle({
+      x: posX - 1,
+      y: posY - 1,
+      width: textWidth + 2,
+      height: textHeight + 2,
+      color: rgb(1, 1, 1),
+      opacity: 1,
+    });
+
+    page.drawText(String(newText), {
+      x: posX,
+      y: posY,
+      size: fsVal,
+      font,
+      color: rgb(0, 0, 0),
+    });
+  }
+
+  const editedBytes = await pdf.save();
+  const outputPath = path.join(UPLOAD_DIR, `text_edited_${uuidv4()}.pdf`);
+  fs.writeFileSync(outputPath, editedBytes);
+  return outputPath;
+}
+
 async function addTextToPdf(filePath, annotations) {
   const pdfBytes = fs.readFileSync(filePath);
   const pdf = await PDFDocument.load(pdfBytes);
@@ -169,4 +264,6 @@ module.exports = {
   compressPdf,
   getPdfInfo,
   addTextToPdf,
+  extractTextFromPdf,
+  applyTextEdits,
 };
