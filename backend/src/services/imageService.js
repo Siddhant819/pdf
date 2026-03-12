@@ -2,8 +2,23 @@ const sharp = require('sharp');
 const { PDFDocument } = require('pdf-lib');
 const fs = require('fs');
 const path = require('path');
+const { createCanvas } = require('canvas');
 const { v4: uuidv4 } = require('uuid');
 const { UPLOAD_DIR } = require('../middleware/upload');
+const { pathToFileURL } = require('url');
+
+const PDFJS_WORKER_PATH = path.resolve(
+  __dirname,
+  '../../node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs'
+);
+
+async function getPdfjsLib() {
+  const { getDocument, GlobalWorkerOptions } = await import(
+    'pdfjs-dist/legacy/build/pdf.mjs'
+  );
+  GlobalWorkerOptions.workerSrc = pathToFileURL(PDFJS_WORKER_PATH).href;
+  return { getDocument };
+}
 
 async function imagesToPdf(imagePaths) {
   const pdfDoc = await PDFDocument.create();
@@ -31,57 +46,58 @@ async function imagesToPdf(imagePaths) {
   return outputPath;
 }
 
-async function pdfPageToImage(pdfPath, pageNum, format = 'png') {
-  const pdfBytes = fs.readFileSync(pdfPath);
-  const pdfDoc = await PDFDocument.load(pdfBytes);
-  const totalPages = pdfDoc.getPageCount();
-  const pageIndex = Math.max(0, Math.min(parseInt(pageNum) - 1 || 0, totalPages - 1));
+async function renderPdfPageToImage(pdfData, pageIndex, scale, format) {
+  const { getDocument } = await getPdfjsLib();
 
-  const singleDoc = await PDFDocument.create();
-  const [copiedPage] = await singleDoc.copyPages(pdfDoc, [pageIndex]);
-  singleDoc.addPage(copiedPage);
+  const standardFontDataUrl = path.resolve(
+    __dirname,
+    '../../node_modules/pdfjs-dist/standard_fonts/'
+  ) + '/';
 
-  const pdfPageBytes = await singleDoc.save();
-  const tempPdfPath = path.join(UPLOAD_DIR, `temp_page_${uuidv4()}.pdf`);
-  fs.writeFileSync(tempPdfPath, pdfPageBytes);
+  const loadingTask = getDocument({
+    data: pdfData,
+    standardFontDataUrl,
+  });
+  const pdf = await loadingTask.promise;
+  const page = await pdf.getPage(pageIndex + 1);
+  const viewport = page.getViewport({ scale: scale || 2.0 });
 
-  const outputExt = format === 'jpeg' ? 'jpg' : 'png';
-  const outputPath = path.join(UPLOAD_DIR, `pdf_page_${uuidv4()}.${outputExt}`);
+  const canvas = createCanvas(Math.round(viewport.width), Math.round(viewport.height));
+  const context = canvas.getContext('2d');
 
-  const page = singleDoc.getPage(0);
-  const { width, height } = page.getSize();
+  context.fillStyle = 'white';
+  context.fillRect(0, 0, canvas.width, canvas.height);
 
-  const svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(width)}" height="${Math.round(height)}">
-    <rect width="100%" height="100%" fill="white"/>
-    <text x="50%" y="50%" text-anchor="middle" dominant-baseline="middle" font-size="16" fill="#666">Page ${pageNum} preview</text>
-  </svg>`;
+  await page.render({ canvasContext: context, viewport }).promise;
 
-  const sharpInstance = sharp(Buffer.from(svgContent))
-    .resize(Math.round(width * 2), Math.round(height * 2));
-
+  let buffer;
   if (format === 'jpeg') {
-    await sharpInstance.jpeg({ quality: 90 }).toFile(outputPath);
+    buffer = canvas.toBuffer('image/jpeg', { quality: 0.9 });
   } else {
-    await sharpInstance.png().toFile(outputPath);
+    buffer = canvas.toBuffer('image/png');
   }
 
-  if (fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath);
-
-  return outputPath;
+  pdf.destroy();
+  return buffer;
 }
 
-async function pdfToImages(pdfPath, format = 'png') {
-  const pdfBytes = fs.readFileSync(pdfPath);
-  const pdfDoc = await PDFDocument.load(pdfBytes);
+async function pdfToImages(pdfPath, format) {
+  const fmt = format === 'jpeg' ? 'jpeg' : 'png';
+  const pdfData = new Uint8Array(fs.readFileSync(pdfPath));
+
+  const pdfDoc = await PDFDocument.load(pdfData);
   const totalPages = pdfDoc.getPageCount();
   const outputPaths = [];
 
   for (let i = 0; i < totalPages; i++) {
-    const outputPath = await pdfPageToImage(pdfPath, i + 1, format);
+    const imageBuffer = await renderPdfPageToImage(pdfData, i, 2.0, fmt);
+    const ext = fmt === 'jpeg' ? 'jpg' : 'png';
+    const outputPath = path.join(UPLOAD_DIR, `pdf_page_${i + 1}_${uuidv4()}.${ext}`);
+    fs.writeFileSync(outputPath, imageBuffer);
     outputPaths.push(outputPath);
   }
 
   return outputPaths;
 }
 
-module.exports = { imagesToPdf, pdfToImages, pdfPageToImage };
+module.exports = { imagesToPdf, pdfToImages };
