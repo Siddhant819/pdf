@@ -116,5 +116,5 @@ pdf/
 - File size limits: 50MB for PDFs, 20MB for images/docs
 - Auto-delete temporary files after 5 minutes
 - File type validation
-- Rate limiting (100 requests per 15 minutes)
+- Rate limiting -100 requests per 15 minutes
 - Helmet.js security headers
