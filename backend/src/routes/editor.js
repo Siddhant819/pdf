@@ -29,11 +29,12 @@ router.post('/extract-text', pdfUpload.single('pdf'), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: 'Please upload a PDF file.' });
     }
-    const pages = await extractTextFromPdf(filePath);
+    const { pages, isScanned } = await extractTextFromPdf(filePath);
     scheduleFileDeletion(filePath, 30 * 60 * 1000);
     res.json({
       success: true,
       pages,
+      isScanned,
       tempFile: req.file.filename,
     });
   } catch (err) {
