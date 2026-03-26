@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { motion } from 'framer-motion'
 import toast from 'react-hot-toast'
-import { Edit3, Plus, Trash2, Type, FileEdit } from 'lucide-react'
+import { Edit3, Plus, Trash2, Type, FileEdit, ScanLine } from 'lucide-react'
 import DropZone from '../components/DropZone'
 import ProgressBar from '../components/ProgressBar'
 import DownloadResult from '../components/DownloadResult'
@@ -22,13 +22,21 @@ function Editor() {
   // Inline text editing state
   const [mode, setMode] = useState('inline') // 'inline' | 'annotate'
   const [extractedPages, setExtractedPages] = useState(null)
+  const [isScanned, setIsScanned] = useState(false)
   const [extracting, setExtracting] = useState(false)
   const [pendingEdits, setPendingEdits] = useState({})
+
+  // OCR state
+  const [ocrRunning, setOcrRunning] = useState(false)
+  const [ocrProgress, setOcrProgress] = useState(0)
+  const [ocrPages, setOcrPages] = useState(null)
 
   async function handleFilesAccepted([accepted]) {
     setFile(accepted)
     setResult(null)
     setExtractedPages(null)
+    setIsScanned(false)
+    setOcrPages(null)
     setPendingEdits({})
 
     setInfoLoading(true)
@@ -55,9 +63,11 @@ function Editor() {
       formData.append('pdf', pdfFile)
       const response = await api.post('/editor/extract-text', formData)
       setExtractedPages(response.data.pages || [])
+      setIsScanned(response.data.isScanned === true)
     } catch {
       toast.error('Could not extract text from PDF')
       setExtractedPages([])
+      setIsScanned(false)
     } finally {
       setExtracting(false)
     }
@@ -71,6 +81,24 @@ function Editor() {
     }
   }
 
+  // Run OCR via Tesseract.js (lazy-imported to keep initial bundle small)
+  async function handleRunOcr() {
+    if (!file) return
+    setOcrRunning(true)
+    setOcrProgress(0)
+    try {
+      const { runOcr } = await import('../utils/ocrService')
+      const result = await runOcr(file, (pct) => setOcrProgress(pct))
+      setOcrPages(result.pages)
+      toast.success('OCR complete! Review and edit the recognised text below.')
+    } catch (err) {
+      console.error('OCR error:', err)
+      toast.error('OCR failed. Please try again.')
+    } finally {
+      setOcrRunning(false)
+    }
+  }
+
   // ── Inline edit save ──────────────────────────────────────────────────────
   async function handleSaveEdits() {
     if (!file) {
@@ -78,23 +106,26 @@ function Editor() {
       return
     }
 
+    const sourcePages = ocrPages || extractedPages || []
+
     const editList = []
-    if (extractedPages) {
-      for (const page of extractedPages) {
-        for (const item of page.items) {
-          const newText = pendingEdits[item.id]
-          if (newText !== undefined && newText !== item.text) {
-            editList.push({
-              pageNum: page.pageNum,
-              x: item.x,
-              y: item.y,
-              width: item.width,
-              height: item.height,
-              fontSize: item.fontSize,
-              originalText: item.text,
-              newText,
-            })
-          }
+    for (const page of sourcePages) {
+      for (const item of page.items) {
+        const newText = pendingEdits[item.id]
+        if (newText !== undefined && newText !== item.text) {
+          editList.push({
+            pageNum: page.pageNum,
+            x: item.x,
+            y: item.y,
+            width: item.width,
+            height: item.height,
+            fontSize: item.fontSize,
+            fontName: item.fontName || '',
+            bold: item.bold || false,
+            italic: item.italic || false,
+            originalText: item.text,
+            newText,
+          })
         }
       }
     }
@@ -176,10 +207,14 @@ function Editor() {
     setResult(null)
     setProgress(0)
     setExtractedPages(null)
+    setIsScanned(false)
+    setOcrPages(null)
     setPendingEdits({})
   }
 
   const editCount = Object.values(pendingEdits).length
+  // Which pages to show in the editor: OCR results take priority over extracted
+  const displayPages = ocrPages || extractedPages
 
   return (
     <div className="max-w-4xl mx-auto px-4 py-12">
@@ -253,23 +288,60 @@ function Editor() {
                       </div>
                     )}
 
-                    {extractedPages && extractedPages.length === 0 && (
+                    {/* Scanned PDF banner */}
+                    {!extracting && isScanned && !ocrPages && (
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 space-y-3">
+                        <div className="flex items-start gap-3">
+                          <ScanLine className="w-5 h-5 text-amber-600 mt-0.5 shrink-0" />
+                          <div>
+                            <p className="text-sm font-medium text-amber-800">Scanned PDF detected</p>
+                            <p className="text-sm text-amber-700 mt-0.5">
+                              No selectable text was found. This PDF likely contains scanned images.
+                              Use OCR to recognise and edit the text.
+                            </p>
+                          </div>
+                        </div>
+                        {ocrRunning ? (
+                          <ProgressBar progress={ocrProgress} label="Running OCR…" />
+                        ) : (
+                          <button
+                            onClick={handleRunOcr}
+                            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 transition-colors"
+                          >
+                            <ScanLine className="w-4 h-4" />
+                            Run OCR
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {/* OCR progress while running on non-scanned (manual trigger fallback) */}
+                    {ocrRunning && !isScanned && (
+                      <ProgressBar progress={ocrProgress} label="Running OCR…" />
+                    )}
+
+                    {displayPages && displayPages.length === 0 && !isScanned && (
                       <p className="text-sm text-amber-600 bg-amber-50 rounded-lg p-3">
                         No editable text was found in this PDF. The PDF may use scanned images
                         or non-standard fonts. Try the "Add Annotations" mode instead.
                       </p>
                     )}
 
-                    {extractedPages && extractedPages.length > 0 && (
+                    {displayPages && displayPages.length > 0 && (
                       <>
-                        <div className="flex items-center justify-between">
+                        <div className="flex items-center justify-between flex-wrap gap-2">
                           <p className="text-sm text-gray-600">
+                            {ocrPages && (
+                              <span className="inline-flex items-center gap-1 text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full text-xs font-medium mr-2">
+                                <ScanLine className="w-3 h-3" /> OCR
+                              </span>
+                            )}
                             <span className="font-medium">
-                              {extractedPages.reduce((n, p) => n + p.items.length, 0)}
+                              {displayPages.reduce((n, p) => n + p.items.length, 0)}
                             </span>{' '}
-                            text elements found across{' '}
-                            <span className="font-medium">{extractedPages.length}</span> page(s).
-                            Click any text below to edit it.
+                            text elements across{' '}
+                            <span className="font-medium">{displayPages.length}</span> page(s).
+                            Click any text to edit.
                           </p>
                           {editCount > 0 && (
                             <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-medium">
@@ -280,7 +352,7 @@ function Editor() {
 
                         <PdfTextEditor
                           file={file}
-                          pages={extractedPages}
+                          pages={displayPages}
                           onEditsChange={setPendingEdits}
                         />
                       </>
@@ -290,7 +362,7 @@ function Editor() {
 
                     <button
                       onClick={handleSaveEdits}
-                      disabled={!file || loading || extracting}
+                      disabled={!file || loading || extracting || ocrRunning}
                       className="btn-primary w-full"
                     >
                       {loading ? 'Saving...' : 'Save Edited PDF'}

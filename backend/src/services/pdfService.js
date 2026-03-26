@@ -122,6 +122,32 @@ async function getPdfInfo(filePath) {
   };
 }
 
+/**
+ * Detect font style (bold / italic) from the raw font name string embedded in the PDF.
+ * PDF font names often follow patterns like "Arial-BoldItalicMT" or "TimesNewRomanPS-BoldMT".
+ */
+function detectFontStyle(fontName) {
+  const name = (fontName || '').toLowerCase();
+  const bold = /bold|black|heavy|semibold|demi/.test(name);
+  const italic = /italic|oblique|slanted/.test(name);
+  return { bold, italic };
+}
+
+/**
+ * Map a raw PDF font name to a human-readable family name used in the UI.
+ * The full mapping (including pdf-lib StandardFont selection) lives in fontMap.js on
+ * the frontend; here we just attach a cleaned-up display name to each text item.
+ */
+function normaliseFontFamily(fontName) {
+  const name = (fontName || '').replace(/[,+].*$/, '').trim(); // strip subset prefix like "ABCDEF+"
+  if (!name) return 'Unknown';
+  // Strip common MT / PS suffixes and style words for a cleaner display name
+  return name
+    .replace(/-(Bold|Italic|Oblique|Regular|Roman|MT|PS|BoldItalic|BoldOblique|LightItalic|Light|Medium|Narrow|Condensed|Extended).*/i, '')
+    .replace(/(Bold|Italic|Oblique|Regular|Roman|MT)$/i, '')
+    .trim() || name;
+}
+
 async function extractTextFromPdf(filePath) {
   const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist/legacy/build/pdf.mjs');
   const workerPath = require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
@@ -131,6 +157,8 @@ async function extractTextFromPdf(filePath) {
   const pdf = await getDocument({ data: new Uint8Array(pdfBytes) }).promise;
 
   const pages = [];
+  let totalItems = 0;
+
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
     const viewport = page.getViewport({ scale: 1 });
@@ -139,13 +167,14 @@ async function extractTextFromPdf(filePath) {
     const items = [];
     let itemId = 0;
     for (const item of textContent.items) {
-      if (!item.str) continue;
+      if (!item.str || !item.str.trim()) continue;
       const transform = item.transform;
       const x = transform[4];
       const y = transform[5];
       const a = transform[0];
       const b = transform[1];
       const fontSize = Math.max(Math.round(Math.sqrt(a * a + b * b)), 6);
+      const { bold, italic } = detectFontStyle(item.fontName);
 
       items.push({
         id: `p${pageNum}_i${itemId++}`,
@@ -158,9 +187,13 @@ async function extractTextFromPdf(filePath) {
         height: item.height || fontSize,
         fontSize,
         fontName: item.fontName || '',
+        fontFamily: normaliseFontFamily(item.fontName),
+        bold,
+        italic,
       });
     }
 
+    totalItems += items.length;
     pages.push({
       pageNum,
       width: viewport.width,
@@ -169,20 +202,59 @@ async function extractTextFromPdf(filePath) {
     });
   }
 
-  return pages;
+  return { pages, isScanned: totalItems === 0 };
+}
+
+/**
+ * Select the closest pdf-lib StandardFont for a given raw PDF font name.
+ * We inspect the name for family keywords and bold/italic markers.
+ */
+function resolveStandardFont(fontName, bold, italic) {
+  const { StandardFonts } = require('pdf-lib');
+  const name = (fontName || '').toLowerCase();
+
+  const isSerif = /times|roman|georgia|palatin|garamond|bookman|century|charter|utopia/.test(name);
+  const isMono = /courier|mono|typewriter|consol|inconsolata|lucida console/.test(name);
+
+  if (isMono) {
+    if (bold && italic) return StandardFonts.CourierBoldOblique;
+    if (bold) return StandardFonts.CourierBold;
+    if (italic) return StandardFonts.CourierOblique;
+    return StandardFonts.Courier;
+  }
+  if (isSerif) {
+    if (bold && italic) return StandardFonts.TimesBoldItalic;
+    if (bold) return StandardFonts.TimesBold;
+    if (italic) return StandardFonts.TimesItalic;
+    return StandardFonts.TimesRoman;
+  }
+  // Default: sans-serif family (Helvetica)
+  if (bold && italic) return StandardFonts.HelveticaBoldOblique;
+  if (bold) return StandardFonts.HelveticaBold;
+  if (italic) return StandardFonts.HelveticaOblique;
+  return StandardFonts.Helvetica;
 }
 
 async function applyTextEdits(filePath, edits) {
   const pdfBytes = fs.readFileSync(filePath);
   const pdf = await PDFDocument.load(pdfBytes);
 
-  const { rgb, StandardFonts } = require('pdf-lib');
-  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const { rgb } = require('pdf-lib');
+
+  // Cache embedded fonts to avoid re-embedding the same font for every edit
+  const fontCache = {};
+  async function getFont(fontName, bold, italic) {
+    const stdFont = resolveStandardFont(fontName, bold, italic);
+    if (!fontCache[stdFont]) {
+      fontCache[stdFont] = await pdf.embedFont(stdFont);
+    }
+    return fontCache[stdFont];
+  }
 
   for (const edit of edits) {
     if (edit.newText === edit.originalText) continue;
 
-    const { pageNum, x, y, width, height, fontSize, newText } = edit;
+    const { pageNum, x, y, width, height, fontSize, fontName, bold, italic, color, newText } = edit;
     const pageIndex = (parseInt(pageNum) || 1) - 1;
     if (pageIndex < 0 || pageIndex >= pdf.getPageCount()) continue;
 
@@ -193,6 +265,7 @@ async function applyTextEdits(filePath, edits) {
     const posX = parseFloat(x);
     const posY = parseFloat(y);
 
+    // Cover the original text with a white rectangle
     page.drawRectangle({
       x: posX - 1,
       y: posY - 1,
@@ -202,12 +275,22 @@ async function applyTextEdits(filePath, edits) {
       opacity: 1,
     });
 
+    // Resolve the best-matching standard font for this text item
+    const font = await getFont(fontName, bold === true, italic === true);
+
+    // Resolve text color (support hex from annotations, default to black)
+    let textColor = rgb(0, 0, 0);
+    if (color && typeof color === 'string' && color.startsWith('#')) {
+      const [r, g, b] = parseColor(color);
+      textColor = rgb(r, g, b);
+    }
+
     page.drawText(String(newText), {
       x: posX,
       y: posY,
       size: fsVal,
       font,
-      color: rgb(0, 0, 0),
+      color: textColor,
     });
   }
 
