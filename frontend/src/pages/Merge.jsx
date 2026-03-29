@@ -1,11 +1,13 @@
 import { useState } from 'react'
-import { motion } from 'framer-motion'
+import { motion, Reorder } from 'framer-motion'
 import toast from 'react-hot-toast'
-import { Combine } from 'lucide-react'
+import { Combine, GripVertical, X, FileText } from 'lucide-react'
 import DropZone from '../components/DropZone'
 import ProgressBar from '../components/ProgressBar'
 import DownloadResult from '../components/DownloadResult'
 import api from '../utils/api'
+
+let _uid = 0
 
 function Merge() {
   const [files, setFiles] = useState([])
@@ -14,7 +16,8 @@ function Merge() {
   const [result, setResult] = useState(null)
 
   function handleFilesAccepted(accepted) {
-    setFiles((prev) => [...prev, ...accepted])
+    const wrapped = accepted.map((file) => ({ id: ++_uid, file }))
+    setFiles((prev) => [...prev, ...wrapped])
     setResult(null)
   }
 
@@ -31,7 +34,7 @@ function Merge() {
     setProgress(10)
     try {
       const formData = new FormData()
-      files.forEach((f) => formData.append('pdfs', f))
+      files.forEach(({ file }) => formData.append('pdfs', file))
 
       const response = await api.post('/merge', formData, {
         onUploadProgress: (e) => setProgress(Math.round((e.loaded / e.total) * 70) + 10),
@@ -73,10 +76,42 @@ function Merge() {
               onFilesAccepted={handleFilesAccepted}
               accept={{ 'application/pdf': ['.pdf'] }}
               multiple
-              files={files}
-              onRemove={handleRemove}
               label="Drop PDF files here (at least 2)"
             />
+
+            {files.length > 0 && (
+              <div>
+                <p className="text-sm font-medium text-gray-700 mb-2">
+                  Drag to reorder — PDFs will be merged in the order shown below:
+                </p>
+                <Reorder.Group axis="y" values={files} onReorder={setFiles} className="space-y-2">
+                  {files.map(({ id, file }, i) => (
+                    <Reorder.Item
+                      key={id}
+                      value={{ id, file }}
+                      className="flex items-center gap-3 bg-gray-50 rounded-lg px-4 py-2 border border-gray-200 cursor-grab active:cursor-grabbing select-none"
+                    >
+                      <span className="text-xs font-bold text-indigo-500 w-5 text-center shrink-0">
+                        {i + 1}
+                      </span>
+                      <GripVertical className="w-4 h-4 text-gray-400 shrink-0" />
+                      <FileText className="w-4 h-4 text-indigo-500 shrink-0" />
+                      <span className="text-sm text-gray-700 truncate flex-1">{file.name}</span>
+                      <span className="text-xs text-gray-400 shrink-0">
+                        ({(file.size / 1024 / 1024).toFixed(2)} MB)
+                      </span>
+                      <button
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onClick={() => handleRemove(i)}
+                        className="text-gray-400 hover:text-red-500 transition-colors shrink-0"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </Reorder.Item>
+                  ))}
+                </Reorder.Group>
+              </div>
+            )}
 
             {loading && <ProgressBar progress={progress} label="Merging PDFs..." />}
 
