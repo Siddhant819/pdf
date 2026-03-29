@@ -18,6 +18,10 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   import.meta.url,
 ).href
 
+// Re-export so callers that previously imported OCR_LANGUAGES from here
+// continue to work without changes.
+export { OCR_LANGUAGES } from './ocrLanguages'
+
 /**
  * Render a single PDF page to an HTMLCanvasElement at the given scale.
  * @param {import('pdfjs-dist').PDFPageProxy} page
@@ -78,17 +82,18 @@ function wordToItem(word, pageNum, itemIndex, pageHeight, scale) {
  *
  * @param {File} file  – the PDF File object
  * @param {(progress: number) => void} [onProgress]  – called with 0–100
+ * @param {string} [lang]  – Tesseract language code(s), e.g. 'eng' or 'eng+fra'. Defaults to 'eng'.
  * @returns {Promise<{ pages: Array, isScanned: true }>}
  */
-export async function runOcr(file, onProgress) {
+export async function runOcr(file, onProgress, lang = 'eng') {
   onProgress?.(5)
 
   const buffer = await file.arrayBuffer()
   const pdf = await pdfjsLib.getDocument({ data: buffer }).promise
 
-  // Initialise a single Tesseract worker (English).
+  // Initialise a single Tesseract worker with the requested language(s).
   // OEM 1 = LSTM engine only (best accuracy for most documents).
-  const worker = await createWorker('eng', 1, {
+  const worker = await createWorker(lang, 1, {
     logger: (m) => {
       if (m.status === 'recognizing text') {
         // m.progress is 0–1 per page; we spread across 10–90% of overall progress

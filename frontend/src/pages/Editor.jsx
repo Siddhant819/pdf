@@ -1,12 +1,13 @@
 import { useState } from 'react'
 import { motion } from 'framer-motion'
 import toast from 'react-hot-toast'
-import { Edit3, Plus, Trash2, Type, FileEdit, ScanLine } from 'lucide-react'
+import { Edit3, Plus, Trash2, Type, FileEdit, ScanLine, Languages } from 'lucide-react'
 import DropZone from '../components/DropZone'
 import ProgressBar from '../components/ProgressBar'
 import DownloadResult from '../components/DownloadResult'
 import PdfTextEditor from '../components/PdfTextEditor'
 import api from '../utils/api'
+import { OCR_LANGUAGES } from '../utils/ocrLanguages'
 
 const DEFAULT_ANNOTATION = { page: 1, text: '', x: 50, y: 50, size: 14, color: '#000000' }
 
@@ -30,6 +31,7 @@ function Editor() {
   const [ocrRunning, setOcrRunning] = useState(false)
   const [ocrProgress, setOcrProgress] = useState(0)
   const [ocrPages, setOcrPages] = useState(null)
+  const [ocrLang, setOcrLang] = useState('eng')
 
   async function handleFilesAccepted([accepted]) {
     setFile(accepted)
@@ -88,9 +90,10 @@ function Editor() {
     setOcrProgress(0)
     try {
       const { runOcr } = await import('../utils/ocrService')
-      const result = await runOcr(file, (pct) => setOcrProgress(pct))
+      const result = await runOcr(file, (pct) => setOcrProgress(pct), ocrLang)
       setOcrPages(result.pages)
-      toast.success('OCR complete! Review and edit the recognised text below.')
+      const langLabel = OCR_LANGUAGES.find((l) => l.code === ocrLang)?.label || ocrLang
+      toast.success(`OCR complete (${langLabel})! Review and edit the recognised text below.`)
     } catch (err) {
       console.error('OCR error:', err)
       toast.error('OCR failed. Please try again.')
@@ -297,10 +300,29 @@ function Editor() {
                             <p className="text-sm font-medium text-amber-800">Scanned PDF detected</p>
                             <p className="text-sm text-amber-700 mt-0.5">
                               No selectable text was found. This PDF likely contains scanned images.
-                              Use OCR to recognise and edit the text.
+                              Select the document language and run OCR to recognise and edit the text.
                             </p>
                           </div>
                         </div>
+
+                        {/* Language selector */}
+                        <div className="flex items-center gap-2">
+                          <Languages className="w-4 h-4 text-amber-600 shrink-0" />
+                          <label className="text-xs font-medium text-amber-800 shrink-0">
+                            Document language:
+                          </label>
+                          <select
+                            value={ocrLang}
+                            onChange={(e) => setOcrLang(e.target.value)}
+                            disabled={ocrRunning}
+                            className="flex-1 text-sm border border-amber-300 rounded-lg px-2 py-1 bg-white focus:outline-none focus:ring-2 focus:ring-amber-400 disabled:opacity-50"
+                          >
+                            {OCR_LANGUAGES.map((l) => (
+                              <option key={l.code} value={l.code}>{l.label}</option>
+                            ))}
+                          </select>
+                        </div>
+
                         {ocrRunning ? (
                           <ProgressBar progress={ocrProgress} label="Running OCR…" />
                         ) : (
@@ -313,6 +335,45 @@ function Editor() {
                           </button>
                         )}
                       </div>
+                    )}
+
+                    {/* Manual OCR trigger for non-scanned PDFs (optional) */}
+                    {!extracting && !isScanned && extractedPages && extractedPages.length > 0 && !ocrPages && (
+                      <details className="rounded-xl border border-gray-200">
+                        <summary className="flex items-center gap-2 px-4 py-2.5 text-sm text-gray-500 cursor-pointer hover:bg-gray-50 rounded-xl select-none">
+                          <Languages className="w-4 h-4" />
+                          Need OCR for a specific language?
+                        </summary>
+                        <div className="px-4 pb-4 pt-2 space-y-3">
+                          <p className="text-xs text-gray-500">
+                            If the PDF contains non-Latin text (e.g. Arabic, Chinese, Devanagari) that
+                            was not extracted correctly, select the language and run OCR.
+                          </p>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <select
+                              value={ocrLang}
+                              onChange={(e) => setOcrLang(e.target.value)}
+                              disabled={ocrRunning}
+                              className="text-sm border border-gray-200 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:opacity-50"
+                            >
+                              {OCR_LANGUAGES.map((l) => (
+                                <option key={l.code} value={l.code}>{l.label}</option>
+                              ))}
+                            </select>
+                            {ocrRunning ? (
+                              <ProgressBar progress={ocrProgress} label="Running OCR…" />
+                            ) : (
+                              <button
+                                onClick={handleRunOcr}
+                                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 transition-colors"
+                              >
+                                <ScanLine className="w-4 h-4" />
+                                Run OCR
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </details>
                     )}
 
                     {/* OCR progress while running on non-scanned (manual trigger fallback) */}
@@ -334,6 +395,8 @@ function Editor() {
                             {ocrPages && (
                               <span className="inline-flex items-center gap-1 text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full text-xs font-medium mr-2">
                                 <ScanLine className="w-3 h-3" /> OCR
+                                {' · '}
+                                {OCR_LANGUAGES.find((l) => l.code === ocrLang)?.label || ocrLang}
                               </span>
                             )}
                             <span className="font-medium">
