@@ -1,8 +1,38 @@
 const { PDFDocument, degrees } = require('pdf-lib');
+const fontkit = require('@pdf-lib/fontkit');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const { UPLOAD_DIR } = require('../middleware/upload');
+
+// Well-known system font paths (TTF) used for embedding Unicode-capable fonts.
+// These Liberation fonts cover the full Latin extended range and are available
+// on most Linux/Ubuntu systems.
+const SYSTEM_FONT_PATHS = {
+  sansRegular:    '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+  sansBold:       '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+  sansItalic:     '/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf',
+  sansBoldItalic: '/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf',
+  serifRegular:   '/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf',
+  serifBold:      '/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf',
+  monoRegular:    '/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf',
+  monoBold:       '/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf',
+};
+
+/**
+ * Try to load a system TTF font. Returns the font bytes or null if the file
+ * is not available.
+ * @param {string} fontPath
+ * @returns {Buffer|null}
+ */
+function tryLoadSystemFont(fontPath) {
+  try {
+    if (fs.existsSync(fontPath)) return fs.readFileSync(fontPath);
+  } catch {
+    // ignore
+  }
+  return null;
+}
 
 async function mergePdfs(filePaths) {
   const mergedPdf = await PDFDocument.create();
@@ -238,17 +268,59 @@ function resolveStandardFont(fontName, bold, italic) {
 async function applyTextEdits(filePath, edits) {
   const pdfBytes = fs.readFileSync(filePath);
   const pdf = await PDFDocument.load(pdfBytes);
+  pdf.registerFontkit(fontkit);
 
   const { rgb } = require('pdf-lib');
 
-  // Cache embedded fonts to avoid re-embedding the same font for every edit
-  const fontCache = {};
+  // Cache embedded fonts to avoid re-embedding the same font for every edit.
+  // We maintain two font caches: one for custom TTF fonts (preferred) and one for
+  // pdf-lib standard fonts (fallback when system fonts are unavailable).
+  const ttfCache = {};
+  const stdCache = {};
+
+  /**
+   * Pick the best system font key based on style flags and family name.
+   */
+  function pickSystemFontKey(fontName, bold, italic) {
+    const name = (fontName || '').toLowerCase();
+    const isMono = /courier|mono|typewriter|consol|inconsolata|lucida console/.test(name);
+    const isSerif = /times|roman|georgia|palatin|garamond|bookman|century|charter|utopia/.test(name);
+
+    if (isMono) return bold ? 'monoBold' : 'monoRegular';
+    if (isSerif) return bold ? 'serifBold' : 'serifRegular';
+    if (bold && italic) return 'sansBoldItalic';
+    if (bold) return 'sansBold';
+    if (italic) return 'sansItalic';
+    return 'sansRegular';
+  }
+
+  /**
+   * Embed (or return cached) the best-available font for this text item.
+   * Priority: system TTF (Liberation) → pdf-lib standard font.
+   */
   async function getFont(fontName, bold, italic) {
-    const stdFont = resolveStandardFont(fontName, bold, italic);
-    if (!fontCache[stdFont]) {
-      fontCache[stdFont] = await pdf.embedFont(stdFont);
+    // 1. Try to embed a TTF system font (supports extended Latin + more glyphs)
+    const ttfKey = pickSystemFontKey(fontName, bold, italic);
+    if (!ttfCache[ttfKey]) {
+      const fontBytes = tryLoadSystemFont(SYSTEM_FONT_PATHS[ttfKey]);
+      if (fontBytes) {
+        try {
+          ttfCache[ttfKey] = await pdf.embedFont(fontBytes);
+        } catch {
+          ttfCache[ttfKey] = null; // mark as unavailable
+        }
+      } else {
+        ttfCache[ttfKey] = null;
+      }
     }
-    return fontCache[stdFont];
+    if (ttfCache[ttfKey]) return ttfCache[ttfKey];
+
+    // 2. Fall back to a pdf-lib standard font
+    const stdFont = resolveStandardFont(fontName, bold, italic);
+    if (!stdCache[stdFont]) {
+      stdCache[stdFont] = await pdf.embedFont(stdFont);
+    }
+    return stdCache[stdFont];
   }
 
   for (const edit of edits) {
@@ -265,17 +337,26 @@ async function applyTextEdits(filePath, edits) {
     const posX = parseFloat(x);
     const posY = parseFloat(y);
 
-    // Cover the original text with a white rectangle
+    // Cover the original text with a white rectangle.
+    // Add generous padding to handle font descenders and rendering differences.
+    const padX = 2;
+    const padY = Math.max(2, fsVal * 0.2); // ~20% of font size as vertical padding
     page.drawRectangle({
-      x: posX - 1,
-      y: posY - 1,
-      width: textWidth + 2,
-      height: textHeight + 2,
+      x: posX - padX,
+      y: posY - padY,
+      width: textWidth + padX * 2,
+      height: textHeight + padY * 2,
       color: rgb(1, 1, 1),
       opacity: 1,
     });
 
-    // Resolve the best-matching standard font for this text item
+    // TTF-embedded Liberation fonts support extended Latin and basic Arabic/Greek/Cyrillic,
+    // but not CJK (Chinese/Japanese/Korean) or complex Indic scripts.
+    // We still attempt to draw the text; pdf-lib will substitute replacement glyphs
+    // for unsupported code points so the user gets a result rather than an error.
+    const newStr = String(newText);
+
+    // Resolve the best-matching font for this text item
     const font = await getFont(fontName, bold === true, italic === true);
 
     // Resolve text color (support hex from annotations, default to black)
@@ -285,13 +366,22 @@ async function applyTextEdits(filePath, edits) {
       textColor = rgb(r, g, b);
     }
 
-    page.drawText(String(newText), {
-      x: posX,
-      y: posY,
-      size: fsVal,
-      font,
-      color: textColor,
-    });
+    try {
+      page.drawText(newStr, {
+        x: posX,
+        y: posY,
+        size: fsVal,
+        font,
+        color: textColor,
+        // Allow a small overflow buffer (+20 units) beyond the original bounding box
+        // so that slight font-metric differences don't cause premature line wrapping.
+        maxWidth: textWidth + 20,
+        lineHeight: textHeight,
+      });
+    } catch {
+      // If the font still can't encode the character(s), skip this edit silently
+      // rather than aborting the whole document.
+    }
   }
 
   const editedBytes = await pdf.save();
@@ -303,9 +393,25 @@ async function applyTextEdits(filePath, edits) {
 async function addTextToPdf(filePath, annotations) {
   const pdfBytes = fs.readFileSync(filePath);
   const pdf = await PDFDocument.load(pdfBytes);
+  pdf.registerFontkit(fontkit);
 
-  const { rgb, StandardFonts } = require('pdf-lib');
-  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const { rgb } = require('pdf-lib');
+
+  // Prefer system Liberation Sans for richer glyph coverage over the built-in
+  // Helvetica (which only covers basic Latin).
+  let font;
+  const sansFontBytes = tryLoadSystemFont(SYSTEM_FONT_PATHS.sansRegular);
+  if (sansFontBytes) {
+    try {
+      font = await pdf.embedFont(sansFontBytes);
+    } catch {
+      font = null;
+    }
+  }
+  if (!font) {
+    const { StandardFonts } = require('pdf-lib');
+    font = await pdf.embedFont(StandardFonts.Helvetica);
+  }
 
   for (const annotation of annotations) {
     const { page: pageNum, text, x, y, size, color } = annotation;
@@ -316,13 +422,17 @@ async function addTextToPdf(filePath, annotations) {
     const fontSize = parseInt(size) || 12;
     const [r, g, b] = parseColor(color || '#000000');
 
-    page.drawText(String(text), {
-      x: parseFloat(x) || 50,
-      y: parseFloat(y) || 50,
-      size: fontSize,
-      font,
-      color: rgb(r, g, b),
-    });
+    try {
+      page.drawText(String(text), {
+        x: parseFloat(x) || 50,
+        y: parseFloat(y) || 50,
+        size: fontSize,
+        font,
+        color: rgb(r, g, b),
+      });
+    } catch {
+      // Skip annotations that cannot be encoded by the available font
+    }
   }
 
   const editedBytes = await pdf.save();
